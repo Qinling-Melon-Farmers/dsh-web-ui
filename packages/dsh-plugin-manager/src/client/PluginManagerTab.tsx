@@ -59,6 +59,8 @@ export interface PluginManagerTabInjected {
   controlsSetEnabled: (pluginId: string, enabled: boolean) => Promise<PluginControlItem[]>
   /** Conflicts the gateway host computed around the last install (gateway mode only). */
   lastInstallConflicts?: () => readonly ControlChange[]
+  /** Preflight note of the last settled gateway install (composition-only, B6). */
+  lastPreflightNote?: () => string | undefined
 }
 
 /** Full component props assembled by the Settings slot renderer. */
@@ -156,6 +158,7 @@ export function PluginManagerTab(props: PluginManagerTabProps) {
     controlsList,
     controlsSetEnabled,
     lastInstallConflicts,
+    lastPreflightNote,
   } = props
 
   const [view, setView] = useState<ViewState>({ status: 'loading' })
@@ -171,6 +174,7 @@ export function PluginManagerTab(props: PluginManagerTabProps) {
   const [updates, setUpdates] = useState<ReadonlyMap<string, string>>(new Map())
   const [uninstallTarget, setUninstallTarget] = useState<UninstallTarget | undefined>(undefined)
   const [conflicts, setConflicts] = useState<readonly ControlChange[]>([])
+  const [preflightNote, setPreflightNote] = useState<string | undefined>(undefined)
   const [progress, setProgress] = useState<InstallProgressItem>({ kind: 'idle', stage: 'fetch' })
   /** Synchronous in-flight mirror of `busy`: the render-time guard alone lets a
    * click and an Enter land in the same frame and double-fire. */
@@ -225,6 +229,7 @@ export function PluginManagerTab(props: PluginManagerTabProps) {
         setDirty(true)
         const after = await controlsList().catch(() => [] as readonly PluginControlItem[])
         setConflicts(lastInstallConflicts !== undefined ? lastInstallConflicts() : diffControls(before, after))
+        setPreflightNote(lastPreflightNote !== undefined ? lastPreflightNote() : undefined)
         await reload()
       } catch (reason) {
         const reasonText = messageOf(reason)
@@ -472,6 +477,13 @@ export function PluginManagerTab(props: PluginManagerTabProps) {
               {repairing === 'install' ? t('repairing') : t('repair')}
             </Button>
           )}
+        </div>
+      )}
+
+      {preflightNote !== undefined && (
+        <div className={css.conflicts}>
+          <h3 className={css.sectionTitle}>{t('preflightNoteTitle')}</h3>
+          <p className={css.sub}>{preflightNote}</p>
         </div>
       )}
 

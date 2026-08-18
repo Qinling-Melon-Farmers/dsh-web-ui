@@ -3,21 +3,28 @@
  * `dsh plugin --profile <name> add|remove` CLI — the single writer for the
  * profile — with a bounded job table the HTTP layer polls. Every run captures
  * a layer snapshot before and after so the caller can render exactly what the
- * CLI changed (the conflict ledger). The npm web runtime has no installer
- * service, so this gateway is its write path; on runtimes with official
- * channels the browser half never calls it.
+ * CLI changed (the conflict ledger). Mutations are serialized through one
+ * promise chain so snapshots never interleave across jobs. The npm web runtime
+ * has no installer service, so this gateway is its write path; on runtimes
+ * with official channels the browser half never calls it.
+ *
+ * Known upstream limitation: the official `dsh plugin` CLI forwards to pnpm
+ * with `shell: process.platform === 'win32'` inside the DSH launcher itself.
+ * This package spawns the CLI without a shell and whitelists specs at the
+ * route, but the final shell hop belongs to upstream DSH and cannot be
+ * removed here (documented in the README security model).
  * @module @linxin666/dsh-client-ui-plugin-manager/host
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type { InstalledPluginItem } from '../core/protocol.ts'
 import type { ControlChange } from '../core/conflict.ts'
 import { diffLayer, overlappingIds, significantChanges, type LayerChange, type LayerSnapshot } from '../core/patch-diff.ts'
-import { readPatchText, readProfileManifest, type ProfileFacts } from './profile.ts'
-import { parsePatch, bareRowEnabled, bareRowId, setRowEnabled, writePatchAtomic } from './rows.ts'
+import { readProfileManifest, type ProfileFacts } from './profile.ts'
+import { claimedIdsOf, parsePatch, bareRowEnabled, bareRowId } from './rows.ts'
 import { buildPluginRow, claimedEntryIdsOf } from './state.ts'
 
 /** Hard deadline for one CLI add (git clones can take minutes). */
@@ -38,6 +45,8 @@ export interface GatewayJob {
   /** Layer changes the CLI applied, normalized for the conflict panel. */
   conflicts?: ControlChange[]
   error?: string
+  /** Install-only note: the boot preflight is composition-only (see README B6). */
+  preflightNote?: string
 }
 
 /** The binary search roots for the dsh CLI. */
@@ -70,25 +79,45 @@ function capture(chunk: Buffer, buffer: { value: string }): void {
   buffer.value = (buffer.value + chunk.toString()).slice(-MAX_OUTPUT_CHARS)
 }
 
+/** Best-effort wrapper text read for a dsh.cmd shim (missing file means fallback). */
+function readWrapperText(path: string): string | null {
+  try {
+    return readFileSync(path, 'utf8')
+  } catch {
+    return null
+  }
+}
+
 /**
  * The spawn command for the dsh CLI on this platform. Windows runs the
- * npm-generated dsh.cmd wrapper by resolving its node binary and bin.js script
- * and spawning them directly: going through cmd.exe splits unquoted paths with
+ * generated dsh.cmd shim by resolving its node binary and bin.js script and
+ * spawning them directly: going through cmd.exe splits unquoted paths with
  * spaces (`'D:\Program' is not recognized`).
+ *
+ * The bin.js path is parsed from the wrapper text when possible (npm, pnpm
+ * and yarn global shims all carry it); the npm-layout fallback below covers
+ * hand-written wrappers. A shim that resolves through neither path must be
+ * reported so the layout can be added here.
  * @param binary - the dsh CLI path found by {@link findDshBinary}.
  * @param platform - process platform (test seam).
  * @param localNodeExists - existence probe (test seam).
+ * @param readWrapper - wrapper text seam (test seam).
  * @returns the executable and the argument prefix to run the dsh bin script.
  */
 export function dshSpawnCommand(
   binary: string,
   platform: string = process.platform,
   localNodeExists: (path: string) => boolean = existsSync,
+  readWrapper: (path: string) => string | null = readWrapperText,
 ): { command: string; argsPrefix: string[] } {
   if (platform !== 'win32') return { command: binary, argsPrefix: [] }
   const dir = dirname(binary)
+  const wrapper = readWrapper(binary)
+  const wrapperMatch = wrapper?.match(/"%~dp0\\([^"]*bin\.js)"/)
+  const binJs = wrapperMatch != null
+    ? join(dir, wrapperMatch[1])
+    : join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
   const localNode = join(dir, 'node.exe')
-  const binJs = join(dir, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
   return { command: localNodeExists(localNode) ? localNode : process.execPath, argsPrefix: [binJs] }
 }
 
@@ -101,20 +130,23 @@ export function spawnDsh(binary: string, args: string[], env: NodeJS.ProcessEnv)
   })
 }
 
-/** Feature string the official installer channels carry in the boot dump. */
-const OFFICIAL_INSTALLER_MARK = 'plugin-installer'
+/** Exact entry line the official installer row carries in the boot dump. */
+const OFFICIAL_INSTALLER_ROW = /(^|\n)\s*(?:-\s*)?(?:id|name):\s*['"]?ui-settings-plugin-installer\b/m
 
 /**
  * Detect whether the official installer channels exist on this runtime by
- * dumping the boot composition once: the npm-published web never contains
- * `plugin-installer` entries, DSHCode and the checkout web do. The browser
- * half reads the verdict from the `/mode` route so its channel probe never
- * has to hit the missing official route (which 405s into the console).
+ * dumping the boot composition once: the npm-published web never contains an
+ * `ui-settings-plugin-installer` entry row, DSHCode and the checkout web do.
+ * The match is line-exact (id or name equals the installer entry) so an
+ * unrelated plugin whose name merely contains the substring cannot flip the
+ * verdict. The browser half reads the result from the `/mode` route so its
+ * channel probe never hits the missing official route (which 405s into the
+ * console).
  * @param binary - dsh CLI path.
  * @param profileName - boot profile name.
  * @param env - process environment.
  * @param spawnImpl - spawn seam (test seam).
- * @returns true when the dump names the official installer channels.
+ * @returns true when the dump contains the official installer entry row.
  */
 export async function detectOfficialChannels(
   binary: string,
@@ -128,7 +160,26 @@ export async function detectOfficialChannels(
   child.stderr?.on('data', (chunk: Buffer) => { output.value = (output.value + chunk.toString()).slice(-MAX_OUTPUT_CHARS) })
   const code = await new Promise<number | null>(resolve => { child.on('close', resolve) })
   if (code !== 0) return false
-  return output.value.includes(OFFICIAL_INSTALLER_MARK)
+  return OFFICIAL_INSTALLER_ROW.test(output.value)
+}
+
+/**
+ * The entry ids a link/file spec would claim, preflight-read from the target
+ * directory's bundle patch. Returns undefined when the spec is not a
+ * local-directory spec (npm/git specs cannot be preflighted); an empty array
+ * means the target has no bundle patch and claims its own package name.
+ * @param spec - the install spec recorded by the route.
+ * @returns the claimed ids, or undefined when the spec is not preflightable.
+ */
+export async function preflightClaimedIds(spec: string): Promise<string[] | undefined> {
+  const target = spec.match(/^(?:link|file):(.+)$/)?.[1]
+  if (target === undefined) return undefined
+  try {
+    const text = await readFile(join(target, 'cordis.patch.yml'), 'utf8')
+    return claimedIdsOf(text)
+  } catch {
+    return []
+  }
 }
 
 /** One layer snapshot plus the dependency list of the profile. */
@@ -137,22 +188,32 @@ interface CapturedState {
   dependencies: string[]
 }
 
-/** The gateway: serializes CLI operations through one job table. */
+/** One CLI run result (bounded tail of stdout+stderr). */
+interface CliRunResult {
+  code: number | null
+  output: string
+}
+
+/** The gateway: serializes CLI operations through one mutation queue. */
 export class CliGateway {
   private readonly jobs = new Map<string, GatewayJob>()
   private counter = 0
+  /** Mutation chain: every job's before/after snapshots must not interleave. */
+  private queue: Promise<void> = Promise.resolve()
 
   /** @param facts - resolved profile locations. */
   constructor(
     private readonly facts: ProfileFacts,
     private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly spawnImpl: typeof spawnDsh = spawnDsh,
+    private readonly findBinary: typeof findDshBinary = findDshBinary,
   ) {}
 
   /** Start an install; the caller polls {@link status}. */
   install(spec: string): { jobId: string } {
     const job: GatewayJob = { id: `job-${++this.counter}`, action: 'install', spec, phase: 'running' }
     this.jobs.set(job.id, job)
-    void this.run(job, ['plugin', '--profile', this.facts.profileName, 'add', spec], ADD_TIMEOUT_MS)
+    this.enqueue(job, ['plugin', '--profile', this.facts.profileName, 'add', spec], ADD_TIMEOUT_MS)
     return { jobId: job.id }
   }
 
@@ -160,7 +221,7 @@ export class CliGateway {
   remove(id: string): { jobId: string } {
     const job: GatewayJob = { id: `job-${++this.counter}`, action: 'remove', spec: id, phase: 'running' }
     this.jobs.set(job.id, job)
-    void this.run(job, ['plugin', '--profile', this.facts.profileName, 'remove', id], REMOVE_TIMEOUT_MS)
+    this.enqueue(job, ['plugin', '--profile', this.facts.profileName, 'remove', id], REMOVE_TIMEOUT_MS)
     return { jobId: job.id }
   }
 
@@ -169,6 +230,27 @@ export class CliGateway {
     const job = this.jobs.get(jobId)
     if (job === undefined) return undefined
     return { ...job, conflicts: job.conflicts === undefined ? undefined : [...job.conflicts] }
+  }
+
+  /** Chain the run onto the mutation queue so jobs settle one after another. */
+  private enqueue(job: GatewayJob, args: string[], timeoutMs: number): void {
+    this.queue = this.queue.then(() => this.run(job, args, timeoutMs)).catch(() => {})
+  }
+
+  /** Run one CLI operation to settlement, capturing its bounded output. */
+  private async cliRun(args: string[], timeoutMs: number): Promise<CliRunResult> {
+    const binary = this.findBinary(this.env)
+    if (binary === null) return { code: null, output: 'plugin-manager: dsh CLI not found on PATH' }
+    const output = { value: '' }
+    const child = this.spawnImpl(binary, args, this.env)
+    child.stdout?.on('data', (chunk: Buffer) => { capture(chunk, output) })
+    child.stderr?.on('data', (chunk: Buffer) => { capture(chunk, output) })
+    const timer = setTimeout(() => { child.kill() }, timeoutMs)
+    const code = await new Promise<number | null>(resolve => {
+      child.on('close', resolve)
+    })
+    clearTimeout(timer)
+    return { code, output: output.value.trim() }
   }
 
   /** Capture the layer snapshot and the dependency names (tolerant parse). */
@@ -220,41 +302,76 @@ export class CliGateway {
 
   /** Run one CLI operation to settlement. */
   private async run(job: GatewayJob, args: string[], timeoutMs: number): Promise<void> {
-    const binary = findDshBinary(this.env)
-    if (binary === null) {
-      job.phase = 'error'
-      job.error = 'plugin-manager: dsh CLI not found on PATH'
-      return
-    }
     const before = await this.capture()
-    const output = { value: '' }
-    const child = spawnDsh(binary, args, this.env)
-    child.stdout?.on('data', (chunk: Buffer) => { capture(chunk, output) })
-    child.stderr?.on('data', (chunk: Buffer) => { capture(chunk, output) })
-    const timer = setTimeout(() => { child.kill() }, timeoutMs)
-    const code = await new Promise<number | null>(resolve => {
-      child.on('close', resolve)
-    })
-    clearTimeout(timer)
-    if (code !== 0) {
+
+    // Owner-aware preflight (B5, preferred path): for link/file specs the
+    // claimed entry ids are readable before the CLI runs, so a conflict is
+    // refused outright and the existing owner is never touched.
+    if (job.action === 'install') {
+      const refusal = await this.preflightEntryOverlap(job.spec, before)
+      if (refusal !== undefined) {
+        job.phase = 'error'
+        job.error = refusal
+        return
+      }
+    }
+
+    const result = await this.cliRun(args, timeoutMs)
+    if (result.code !== 0) {
       job.phase = 'error'
-      const tail = output.value.trim()
-      job.error = tail === '' ? `plugin-manager: dsh plugin ${job.action} exited with code ${String(code)}` : tail
+      job.error = result.output === ''
+        ? `plugin-manager: dsh plugin ${job.action} exited with code ${String(result.code)}`
+        : result.output
       return
     }
+
     const after = await this.capture()
     const conflicts = significantChanges(diffLayer(before.layer, after.layer))
+
+    // B8: a zero exit is not success — verify the dependency really moved.
     if (job.action === 'install') {
+      const name = this.newDependency(before, after)
+      if (name === undefined) {
+        job.phase = 'error'
+        job.error = `plugin-manager: install reported success but no dependency was added: ${job.spec}`
+        return
+      }
+      const manifest = await readProfileManifest(this.facts.packageJsonPath).catch(() => undefined)
+      if (manifest === undefined || manifest.dependencies[name] === undefined) {
+        job.phase = 'error'
+        job.error = `plugin-manager: install reported success but ${name} is missing from dependencies`
+        return
+      }
+      // The dependency row can exist while the package never materialized
+      // (a link to a missing directory exits 0 with a broken junction): the
+      // installed manifest must be readable for the install to count.
+      const moduleManifest = join(this.facts.profileDir, 'node_modules', ...name.split('/'), 'package.json')
+      if (!existsSync(moduleManifest)) {
+        job.phase = 'error'
+        job.error = `plugin-manager: install reported success but ${name} did not materialize under node_modules`
+        return
+      }
       const duplicate = await this.detectDuplicateClaims(before, after)
       if (duplicate !== undefined) {
-        // A boot-blocking duplicate entry id: disable the new plugin's rows so
-        // the next start cannot double-mount, and surface the conflict with
-        // its undo and repair affordances.
-        await this.disableEntries(duplicate.ids)
-        conflicts.push({ id: duplicate.ids[0] ?? duplicate.name, from: 'enabled', to: 'disabled' })
+        // Owner-aware conflict handling (B5, fallback path): roll back the NEW
+        // package instead of disabling the shared entry id — a bare disabled
+        // row cannot stop the loader's duplicate-id check and would take the
+        // existing owner down with it.
+        await this.rollbackDependency(duplicate.name)
+        conflicts.push({ id: duplicate.name, from: 'uninstalled', to: 'uninstalled' })
+        job.phase = 'error'
+        job.error = `plugin-manager: install rolled back: ${duplicate.name} claims entry id(s) ${duplicate.ids.join(', ')} already owned by another plugin`
+        return
       }
       await this.verifyBoot(job, before, after, conflicts)
+    } else {
+      if (before.dependencies.includes(job.spec) && after.dependencies.includes(job.spec)) {
+        job.phase = 'error'
+        job.error = `plugin-manager: remove reported success but ${job.spec} is still installed`
+        return
+      }
     }
+
     job.conflicts = conflicts.map(change => ({
       id: change.id,
       name: change.id,
@@ -275,57 +392,58 @@ export class CliGateway {
     return claimedEntryIdsOf(this.facts, name)
   }
 
+  /** The entry ids every installed dependency currently claims, excluding one package. */
+  private async takenEntryIds(state: CapturedState, exclude?: string): Promise<Set<string>> {
+    const taken = new Set<string>(state.layer.rows.keys())
+    for (const dep of state.dependencies) {
+      if (dep === exclude) continue
+      for (const id of await this.claimedEntriesOf(dep)) taken.add(id)
+    }
+    return taken
+  }
+
+  /** Preflight one install spec against the owned entry ids (link/file specs only). */
+  private async preflightEntryOverlap(spec: string, before: CapturedState): Promise<string | undefined> {
+    const claimed = await preflightClaimedIds(spec)
+    if (claimed === undefined || claimed.length === 0) return undefined
+    const taken = await this.takenEntryIds(before)
+    const overlap = overlappingIds(claimed, taken)
+    if (overlap.length === 0) return undefined
+    return `plugin-manager: install refused: ${spec} claims entry id(s) ${overlap.join(', ')} already owned by installed plugins`
+  }
+
   /** Whether the new install claims an entry id another plugin already holds. */
   private async detectDuplicateClaims(before: CapturedState, after: CapturedState): Promise<{ name: string; ids: string[] } | undefined> {
     const name = this.newDependency(before, after)
     if (name === undefined) return undefined
     const claimed = await this.claimedEntriesOf(name)
-    const taken = new Set<string>(after.layer.rows.keys())
-    for (const dep of after.dependencies) {
-      if (dep === name) continue
-      for (const id of await this.claimedEntriesOf(dep)) taken.add(id)
-    }
+    const taken = await this.takenEntryIds(after, name)
     const overlap = overlappingIds(claimed, taken)
     if (overlap.length === 0) return undefined
     return { name, ids: overlap }
   }
 
-  /** Disable every listed entry id via bare override rows (backup + tmp + rename). */
-  private async disableEntries(ids: string[]): Promise<void> {
-    let text = await readPatchText(this.facts.patchPath)
-    let changed = false
-    for (const id of ids) {
-      const next = setRowEnabled(text, this.facts.patchPath, id, id, false)
-      if (next !== text) {
-        text = next
-        changed = true
-      }
-    }
-    if (!changed) return
-    await writePatchAtomic(this.facts.patchPath, text)
+  /** Roll back a freshly added dependency via the official CLI (owner-aware B5). */
+  private async rollbackDependency(name: string): Promise<void> {
+    await this.cliRun(['plugin', '--profile', this.facts.profileName, 'remove', name], REMOVE_TIMEOUT_MS)
   }
 
   /**
    * Boot preflight after an install: compose the profile with the CLI's
-   * `--dump-config` (resolves every entry without binding the port). A failure
-   * that implicates the new plugin disables it so the next start cannot fail;
-   * an unrelated failure is reported without touching anything.
+   * `--dump-config` (resolves every entry without binding the port). This is
+   * a composition-only check — it does not import plugin entries, so load-time
+   * failures can still surface at the next start (documented limitation, B6).
+   * A composition failure that implicates the new plugin disables it; an
+   * unrelated failure is reported without touching anything.
    */
   private async verifyBoot(job: GatewayJob, before: CapturedState, after: CapturedState, conflicts: LayerChange[]): Promise<void> {
-    const binary = findDshBinary(this.env)
-    if (binary === null) return
     const name = this.newDependency(before, after)
-    const verifyOutput = { value: '' }
-    const child = spawnDsh(binary, ['--profile', this.facts.profileName, '--dump-config'], this.env)
-    child.stdout?.on('data', (chunk: Buffer) => { capture(chunk, verifyOutput) })
-    child.stderr?.on('data', (chunk: Buffer) => { capture(chunk, verifyOutput) })
-    const timer = setTimeout(() => { child.kill() }, 90_000)
-    const code = await new Promise<number | null>(resolve => {
-      child.on('close', resolve)
-    })
-    clearTimeout(timer)
-    if (code === 0) return
-    const tail = verifyOutput.value.trim()
+    const result = await this.cliRun(['--profile', this.facts.profileName, '--dump-config'], 90_000)
+    if (result.code === 0) {
+      job.preflightNote = '组合预检通过（--dump-config 仅验证组合层，不验证插件加载期行为），请重启后确认插件可用'
+      return
+    }
+    const tail = result.output
     if (name === undefined) {
       job.phase = 'error'
       job.error = tail === '' ? 'plugin-manager: boot preflight failed' : tail
@@ -334,17 +452,19 @@ export class CliGateway {
     const claimed = await this.claimedEntriesOf(name)
     const implicated = tail.includes(name) || claimed.some(id => tail.includes(id))
     if (implicated) {
-      await this.disableEntries(claimed)
-      conflicts.push({ id: claimed[0] ?? name, from: 'enabled', to: 'disabled' })
+      await this.rollbackDependency(name)
+      conflicts.push({ id: claimed[0] ?? name, from: 'uninstalled', to: 'uninstalled' })
       job.phase = 'error'
       job.error = tail === ''
-        ? `plugin-manager: 启动预检失败，已自动禁用 ${name}`
-        : `plugin-manager: 启动预检失败，已自动禁用 ${name}：\n${tail}`
+        ? `plugin-manager: 启动预检失败，已回滚 ${name}`
+        : `plugin-manager: 启动预检失败，已回滚 ${name}：
+${tail}`
     } else {
       job.phase = 'error'
       job.error = tail === ''
         ? 'plugin-manager: 启动预检失败（与本次安装无关）'
-        : `plugin-manager: 启动预检失败（与本次安装无关）：\n${tail}`
+        : `plugin-manager: 启动预检失败（与本次安装无关）：
+${tail}`
     }
   }
 }

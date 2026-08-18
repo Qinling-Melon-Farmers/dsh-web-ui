@@ -46,6 +46,12 @@ export function resolveProfile(argv: readonly string[] = process.argv, env: Node
   if (name === undefined) {
     throw new Error('plugin-manager: cannot determine the boot profile; pass --profile <name> or set DSH_PROFILE')
   }
+  // The profile name becomes a path segment under DSH_HOME/profiles: refuse
+  // separators and traversal so a hostile --profile value cannot escape the
+  // profiles directory.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+    throw new Error('plugin-manager: invalid profile name')
+  }
   const profileDir = join(resolveDshHome(env), 'profiles', name)
   return {
     profileName: name,

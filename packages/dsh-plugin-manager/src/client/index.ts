@@ -70,12 +70,15 @@ interface GatewayJobWire {
   plugin?: unknown
   conflicts?: unknown
   error?: string
+  preflightNote?: string
 }
 
 /** The face extended with the gateway's install-time conflict ledger. */
 export type PluginManagerFace = PluginManagerTabInjected & {
   /** Conflicts the gateway host computed around the last install (gateway mode only). */
   lastInstallConflicts?: () => readonly ControlChange[]
+  /** Preflight note of the last settled gateway install (composition-only, B6). */
+  lastPreflightNote?: () => string | undefined
 }
 
 /** Contribute the family plugin-manager tab to the Plugins settings section. */
@@ -151,6 +154,8 @@ export function apply(ctx: ClientContext): void {
 
   /** The conflict ledger of the last settled gateway install. */
   let lastInstallConflicts: ControlChange[] = []
+  /** Preflight note of the last settled gateway install. */
+  let lastPreflightNote: string | undefined
   /** Whether a gateway install/remove is in flight (drives the progress row). */
   let gatewayInflight = false
 
@@ -167,6 +172,7 @@ export function apply(ctx: ClientContext): void {
         if (started.jobId === undefined) throw new Error('plugin-manager: gateway install returned no job')
         const job = await waitJob(started.jobId)
         lastInstallConflicts = Array.isArray(job.conflicts) ? job.conflicts as ControlChange[] : []
+        lastPreflightNote = typeof job.preflightNote === 'string' ? job.preflightNote : undefined
         return parseInstalledPlugin({ plugin: job.plugin })
       } finally {
         gatewayInflight = false
@@ -277,6 +283,7 @@ export function apply(ctx: ClientContext): void {
     controlsList: async () => (await ensureMode()) === 'official' ? official.controlsList() : gateway.controlsList(),
     controlsSetEnabled: async (id, enabled) => (await ensureMode()) === 'official' ? official.controlsSetEnabled(id, enabled) : gateway.controlsSetEnabled(id, enabled),
     lastInstallConflicts: () => lastInstallConflicts,
+    lastPreflightNote: () => lastPreflightNote,
   })
 
   ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({

@@ -25,4 +25,12 @@ describe('resolveProfile', () => {
   it('throws when nothing names a profile', () => {
     expect(() => resolveProfile(['node', 'bin.js'], env)).toThrow(/cannot determine the boot profile/)
   })
+
+  it.each(['../web', '..\\evil', 'web/../x', 'a/b', 'a b'])('rejects a traversal or separator profile name: %s', (name) => {
+    expect(() => resolveProfile(['node', 'bin.js', '--profile', name], env)).toThrow(/invalid profile name/)
+  })
+
+  it('accepts dot-and-dash profile names', () => {
+    expect(resolveProfile(['node', 'bin.js', '--profile', 'web.test-2'], env).profileName).toBe('web.test-2')
+  })
 })

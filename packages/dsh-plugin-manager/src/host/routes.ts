@@ -22,6 +22,19 @@ export const GATEWAY_PREFIX = '/api/plugin-manager'
 /** Cap on JSON request bodies (an install spec or a toggle is tiny). */
 const MAX_JSON_BODY_BYTES = 64 * 1024
 
+/**
+ * Forbidden characters for install specs. Everything else — npm names,
+ * versions, git URLs, link/file paths including Unicode directory names —
+ * is accepted. cmd.exe metacharacters and the shell punctuation the
+ * upstream pnpm hop would interpret are refused outright: a spec like
+ * \`pkg & echo pwn\` must be a 400, never a spawn. ^ (npm caret range),
+ * % (URL encoding) and quotes are excluded too; prefer exact versions or
+ * plain names. Control characters are never legitimate spec content.
+ */
+const SPEC_FORBIDDEN = /[&|<|>|^|%|!|;|"|'|(|)|\x60|\u0000-\u001f\u007f]/
+/** Upper bound for one spec (registry names and git URLs are far shorter). */
+const SPEC_MAX_LENGTH = 512
+
 /** Registry timeout for one update check. */
 const REGISTRY_TIMEOUT_MS = 30_000
 
@@ -116,11 +129,16 @@ export function makeGatewayRoutes(deps: GatewayRouteDeps): WebRoute[] {
       sendJson(res, 400, { error: 'plugin-manager: install needs a spec' })
       return
     }
+    const target = spec.trim()
+    if (target.length > SPEC_MAX_LENGTH || SPEC_FORBIDDEN.test(target)) {
+      sendJson(res, 400, { error: 'plugin-manager: install spec contains unsupported characters' })
+      return
+    }
     if (!deps.cliAvailable()) {
       sendJson(res, 500, { error: 'plugin-manager: dsh CLI not found on PATH' })
       return
     }
-    sendJson(res, 200, gateway.install(spec.trim()))
+    sendJson(res, 200, gateway.install(target))
   }
 
   const removeHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
