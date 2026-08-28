@@ -32,12 +32,19 @@ export function servicePlan(spec: ServiceSpec, env: NodeJS.ProcessEnv = process.
   }
   if (spec.platform === 'win32') {
     const localAppData = env.LOCALAPPDATA?.trim() || win32.join(home, 'AppData', 'Local')
-    const path = win32.join(localAppData, 'DSH Doctor', 'supervisor.cmd')
+    const dir = win32.join(localAppData, 'DSH Doctor')
+    const path = win32.join(dir, 'supervisor.cmd')
     const content = `@echo off\r\nset "DSH_DOCTOR_HOME=${spec.doctorHome}"\r\n"${executable}" ${spec.args.map(quoteExec).join(' ')}\r\n`
+    // A task that launches a console script shows a visible console window on
+    // the interactive desktop (#1267). wscript.exe is a GUI-subsystem binary,
+    // so a silent WScript.Shell.Run wrapper keeps the window off screen; the
+    // task XML <Hidden> flag was measured to only hide the task list entry.
+    const hiddenPath = win32.join(dir, 'run-hidden.vbs')
+    const hidden = 'CreateObject("Wscript.Shell").Run """" & WScript.Arguments(0) & """", 0, False\r\n'
     const task = 'DSH Doctor Supervisor'
     return {
-      files: [{ path, content, mode: 0o600 }],
-      install: ['schtasks', '/Create', '/F', '/SC', 'ONLOGON', '/TN', task, '/TR', `"${path}"`],
+      files: [{ path, content, mode: 0o600 }, { path: hiddenPath, content: hidden, mode: 0o600 }],
+      install: ['schtasks', '/Create', '/F', '/SC', 'ONLOGON', '/TN', task, '/TR', `wscript.exe "${hiddenPath}" "${path}"`],
       uninstall: ['schtasks', '/Delete', '/F', '/TN', task],
       restart: ['schtasks', '/Run', '/TN', task],
     }

@@ -31,11 +31,18 @@ describe('service adapters', () => {
     expect(plan.install[0]).toBe('systemctl')
   })
 
-  it('renders a per-user Windows scheduled task', () => {
+  it('renders a per-user Windows scheduled task with a silent wrapper', () => {
     const plan = servicePlan({ ...base, executable: 'C:\\Program Files\\nodejs\\node.exe', platform: 'win32' }, { LOCALAPPDATA: 'C:\\Users\\u\\AppData\\Local' })
     expect(plan.files[0]!.path).toBe('C:\\Users\\u\\AppData\\Local\\DSH Doctor\\supervisor.cmd')
     expect(plan.files[0]!.content).toContain('@echo off')
     expect(plan.files[0]!.content).toContain('"C:\\Program Files\\nodejs\\node.exe"')
+    // The hidden-window wrapper (a GUI-subsystem wscript launcher) ships as a
+    // second definition file next to supervisor.cmd (#1267).
+    expect(plan.files[1]!.path).toBe('C:\\Users\\u\\AppData\\Local\\DSH Doctor\\run-hidden.vbs')
+    expect(plan.files[1]!.content).toContain('Wscript.Shell").Run')
+    expect(plan.files[1]!.content).toContain(', 0, False')
+    // The /TR action must start with a bare executable: schtasks folds a
+    // leading quote into the Command field and the task then fails to start.
     expect(plan.install).toEqual([
       'schtasks',
       '/Create',
@@ -45,7 +52,7 @@ describe('service adapters', () => {
       '/TN',
       'DSH Doctor Supervisor',
       '/TR',
-      '"C:\\Users\\u\\AppData\\Local\\DSH Doctor\\supervisor.cmd"',
+      'wscript.exe "C:\\Users\\u\\AppData\\Local\\DSH Doctor\\run-hidden.vbs" "C:\\Users\\u\\AppData\\Local\\DSH Doctor\\supervisor.cmd"',
     ])
     expect(plan.uninstall).toEqual(['schtasks', '/Delete', '/F', '/TN', 'DSH Doctor Supervisor'])
     expect(plan.restart).toEqual(['schtasks', '/Run', '/TN', 'DSH Doctor Supervisor'])
