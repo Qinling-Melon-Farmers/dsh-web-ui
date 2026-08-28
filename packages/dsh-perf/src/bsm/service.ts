@@ -9,6 +9,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFil
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import {
   applyManagedBlock,
   deriveMountState,
@@ -128,18 +129,35 @@ export function buildStatus(paths = resolvePaths()): StatusPayload {
  * keeps the runtime path identical to the maintenance CLI. Falls back to an
  * in-process run when the built artifact is absent (development checkouts).
  */
+/**
+ * Resolve the standalone importer module to a filesystem path. `URL.pathname`
+ * is not a path: on win32 it keeps the leading slash (`/C:/...`), which spawns
+ * resolve as a doubled drive (`C:\C:\...`) and fail with MODULE_NOT_FOUND
+ * (#1257). Non-file URLs (some test runners transform modules) have no
+ * filesystem location, so the caller falls back to the in-process run.
+ */
+export function resolveImporterModulePath(importUrl: string | URL = import.meta.url): string | undefined {
+  if (!String(importUrl).startsWith('file:')) return undefined
+  try {
+    const modulePath = fileURLToPath(importUrl)
+    return existsSync(modulePath) ? modulePath : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export async function runMigration(options: { sessionsDir?: string; dbPath?: string }): Promise<{ summaryJson: string; durationMs: number }> {
   const paths = resolvePaths()
   const effective = { sessionsDir: options.sessionsDir ?? paths.sessionsDir, dbPath: options.dbPath ?? paths.dbPath }
   const startedAt = Date.now()
-  const moduleUrl = new URL('./better-session-import.mjs', import.meta.url)
-  if (!existsSync(moduleUrl)) {
+  const modulePath = resolveImporterModulePath(new URL('./better-session-import.mjs', import.meta.url))
+  if (modulePath === undefined) {
     const summary = runImport({ ...effective, apply: true, createStore: true })
     return { summaryJson: JSON.stringify(summary), durationMs: Date.now() - startedAt }
   }
   return await new Promise((resolvePromise, rejectPromise) => {
     const started = Date.now()
-    const child = spawn(process.execPath, [moduleUrl.pathname], {
+    const child = spawn(process.execPath, [modulePath], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, DSH_IMPORT_OPTIONS: JSON.stringify({ ...effective, apply: true, createStore: true }) },
     })
